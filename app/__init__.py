@@ -1,3 +1,3 @@
-"""Bus OD passenger-flow complementary suppression service."""
+"""新增班次影响分析服务：时刻表调整前后最早到达与接驳影响分析。"""
 
 __version__ = "1.0.0"

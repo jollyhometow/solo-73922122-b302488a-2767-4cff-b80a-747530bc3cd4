@@ -1,0 +1,111 @@
+{
+  "old_timetable": {
+    "label": "调整前环线",
+    "trips": [
+      {
+        "trip_id": "环线L1",
+        "stops": [
+          {
+            "station": "A站",
+            "arrival": 0,
+            "departure": 0
+          },
+          {
+            "station": "B站",
+            "arrival": 100,
+            "departure": 110
+          },
+          {
+            "station": "C站",
+            "arrival": 200,
+            "departure": 210
+          },
+          {
+            "station": "D站",
+            "arrival": 300,
+            "departure": 310
+          },
+          {
+            "station": "A站",
+            "arrival": 400,
+            "departure": 410
+          },
+          {
+            "station": "B站",
+            "arrival": 500,
+            "departure": 510
+          }
+        ]
+      }
+    ]
+  },
+  "new_timetable": {
+    "label": "调整后环线",
+    "trips": [
+      {
+        "trip_id": "环线L1",
+        "stops": [
+          {
+            "station": "A站",
+            "arrival": 120,
+            "departure": 120
+          },
+          {
+            "station": "B站",
+            "arrival": 220,
+            "departure": 230
+          },
+          {
+            "station": "C站",
+            "arrival": 320,
+            "departure": 330
+          },
+          {
+            "station": "D站",
+            "arrival": 420,
+            "departure": 430
+          },
+          {
+            "station": "A站",
+            "arrival": 520,
+            "departure": 530
+          },
+          {
+            "station": "B站",
+            "arrival": 620,
+            "departure": 630
+          }
+        ]
+      }
+    ]
+  },
+  "minimum_transfer_seconds": {
+    "A站": 60,
+    "B站": 60,
+    "C站": 60,
+    "D站": 60
+  },
+  "demands": [
+    {
+      "demand_id": "R1",
+      "origin": "A站",
+      "destination": "B站",
+      "departure_time": 0,
+      "arrival_deadline": 150
+    },
+    {
+      "demand_id": "R2",
+      "origin": "B站",
+      "destination": "A站",
+      "departure_time": 60,
+      "arrival_deadline": 450
+    },
+    {
+      "demand_id": "R3",
+      "origin": "C站",
+      "destination": "D站",
+      "departure_time": 200,
+      "arrival_deadline": 500
+    }
+  ]
+}

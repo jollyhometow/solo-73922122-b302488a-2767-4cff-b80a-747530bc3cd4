@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: bus-od-suppression-api
+    container_name: bus-timetable-impact-api
     ports:
       - "${HOST_PORT:-8000}:8000"
     environment:

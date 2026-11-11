@@ -1,0 +1,104 @@
+{
+  "old_timetable": {
+    "label": "调整前",
+    "trips": [
+      {
+        "trip_id": "T1",
+        "stops": [
+          {
+            "station": "X站",
+            "arrival": 0,
+            "departure": 0
+          },
+          {
+            "station": "P站",
+            "arrival": 300,
+            "departure": 320
+          },
+          {
+            "station": "Y站",
+            "arrival": 600,
+            "departure": 600
+          }
+        ]
+      },
+      {
+        "trip_id": "T2",
+        "stops": [
+          {
+            "station": "P站",
+            "arrival": 380,
+            "departure": 380
+          },
+          {
+            "station": "Z站",
+            "arrival": 500,
+            "departure": 500
+          }
+        ]
+      }
+    ]
+  },
+  "new_timetable": {
+    "label": "调整后",
+    "trips": [
+      {
+        "trip_id": "T1",
+        "stops": [
+          {
+            "station": "X站",
+            "arrival": 0,
+            "departure": 0
+          },
+          {
+            "station": "P站",
+            "arrival": 300,
+            "departure": 320
+          },
+          {
+            "station": "Y站",
+            "arrival": 600,
+            "departure": 600
+          }
+        ]
+      },
+      {
+        "trip_id": "T2",
+        "stops": [
+          {
+            "station": "P站",
+            "arrival": 350,
+            "departure": 350
+          },
+          {
+            "station": "Z站",
+            "arrival": 470,
+            "departure": 470
+          }
+        ]
+      }
+    ]
+  },
+  "minimum_transfer_seconds": {
+    "X站": 30,
+    "P站": 60,
+    "Y站": 30,
+    "Z站": 30
+  },
+  "demands": [
+    {
+      "demand_id": "M1",
+      "origin": "X站",
+      "destination": "Z站",
+      "departure_time": 0,
+      "arrival_deadline": 500
+    },
+    {
+      "demand_id": "M2",
+      "origin": "X站",
+      "destination": "Y站",
+      "departure_time": 0,
+      "arrival_deadline": 600
+    }
+  ]
+}

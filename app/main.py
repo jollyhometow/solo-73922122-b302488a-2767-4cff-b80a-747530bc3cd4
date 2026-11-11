@@ -1,240 +1,507 @@
-"""FastAPI service for complementary cell suppression.
+"""新增班次影响分析 FastAPI 服务。
 
-Run locally:
+接收运营导出的调整前（旧表）、调整后（新表）两份时刻表、各站最短换乘
+秒数及最多 30 条出行调查需求，分别求每条需求的最早到达时间与乘车方案，
+并标出旧表按期而新表超期或不可达的受影响需求。
+
+本地启动：
     uvicorn app.main:app --host 0.0.0.0 --port 8000
 
-Interactive API documentation: http://localhost:8000/docs
+交互文档：http://localhost:8000/docs
 """
 
 from __future__ import annotations
 
 import json
-from typing import Annotated, List, Literal, Optional
+from typing import Dict, List, Literal, Optional
 
 from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .solver import CellRange, NoSolutionError, SolveResult, solve
+from .solver import (
+    MAX_DEMANDS,
+    MAX_STOPS,
+    MAX_TRIPS,
+    Demand,
+    DemandAnalysis,
+    Journey,
+    Leg,
+    ScenarioResult,
+    Timetable,
+    analyze,
+    build_demands,
+    build_timetable,
+    build_transfers,
+    validate_transfer_coverage,
+)
 
 # ---------------------------------------------------------------------------
-# Example data: the small flow at (0, 0) is reverse-inferable before any
-# secondary suppression.  With k=2 it is the only primary cell.  Row 0 fixes
-# it once the other row cells are public, and column 0 does the same.  The
-# minimum safe publication therefore also hides (0,1), (1,0) and (1,1).
+# 示例一：环线。同一车次重复停靠 A、B，停站序号用于区分同一站名的不同停站。
+# 新表整体后移 120 秒：D1、D2 由按期变为超期，D3 仍可按期（允许等待）。
 # ---------------------------------------------------------------------------
-EXAMPLE_REQUEST = {
-    "row_stations": ["人民广场", "陆家嘴"],
-    "column_stations": ["静安寺", "徐家汇", "世纪大道"],
-    "matrix": [[1, 2, 3], [4, 5, 6]],
-    "k": 2,
+RING_EXAMPLE_REQUEST = {
+    "old_timetable": {
+        "label": "调整前环线",
+        "trips": [
+            {
+                "trip_id": "环线L1",
+                "stops": [
+                    {"station": "A站", "arrival": 0, "departure": 0},
+                    {"station": "B站", "arrival": 100, "departure": 110},
+                    {"station": "C站", "arrival": 200, "departure": 210},
+                    {"station": "D站", "arrival": 300, "departure": 310},
+                    {"station": "A站", "arrival": 400, "departure": 410},
+                    {"station": "B站", "arrival": 500, "departure": 510},
+                ],
+            }
+        ],
+    },
+    "new_timetable": {
+        "label": "调整后环线",
+        "trips": [
+            {
+                "trip_id": "环线L1",
+                "stops": [
+                    {"station": "A站", "arrival": 120, "departure": 120},
+                    {"station": "B站", "arrival": 220, "departure": 230},
+                    {"station": "C站", "arrival": 320, "departure": 330},
+                    {"station": "D站", "arrival": 420, "departure": 430},
+                    {"station": "A站", "arrival": 520, "departure": 530},
+                    {"station": "B站", "arrival": 620, "departure": 630},
+                ],
+            }
+        ],
+    },
+    "minimum_transfer_seconds": {
+        "A站": 60,
+        "B站": 60,
+        "C站": 60,
+        "D站": 60,
+    },
+    "demands": [
+        {
+            "demand_id": "R1",
+            "origin": "A站",
+            "destination": "B站",
+            "departure_time": 0,
+            "arrival_deadline": 150,
+        },
+        {
+            "demand_id": "R2",
+            "origin": "B站",
+            "destination": "A站",
+            "departure_time": 60,
+            "arrival_deadline": 450,
+        },
+        {
+            "demand_id": "R3",
+            "origin": "C站",
+            "destination": "D站",
+            "departure_time": 200,
+            "arrival_deadline": 500,
+        },
+    ],
 }
-EXAMPLE_EXPLANATION = (
-    "（0,0）=1 是先隐藏单元。若只隐藏它，第一行合计 6 与其余公开值 2、3 "
-    "可反推出 1；第一列合计 5 与公开值 4 也会得到 1。求解器以最少格数补充隐藏 "
-    "(0,1)、(1,0)、(1,1)，使该单元在保留全部行列合计时可行值为 0～3。"
+RING_EXAMPLE_EXPLANATION = (
+    "环线 L1 依次停靠 A→B→C→D→A→B，A 站、B 站重复停站，方案以停站序号区分。"
+    "新表整体后移 120 秒：R1（A→B）旧表 100 秒到达、新表 220 秒超期；"
+    "R2（B→A，乘至第二圈 A 站第 5 停站）旧表 400 秒到达、新表 520 秒超期；"
+    "R3（C→D）新表虽推迟但仍在期限 500 内，420 秒到达，不受影响。"
+)
+
+# ---------------------------------------------------------------------------
+# 示例二：换乘临界。P 站最短换乘 60 秒，等号可接上。
+# 旧表 T2 在 P 站 380 秒发车，T1 于 300 秒到达，300+60=360<=380 可接续；
+# 新表 T2 提前到 350 秒发车，360>350 无法接续，X→Z 变为不可达。
+# ---------------------------------------------------------------------------
+TRANSFER_EXAMPLE_REQUEST = {
+    "old_timetable": {
+        "label": "调整前",
+        "trips": [
+            {
+                "trip_id": "T1",
+                "stops": [
+                    {"station": "X站", "arrival": 0, "departure": 0},
+                    {"station": "P站", "arrival": 300, "departure": 320},
+                    {"station": "Y站", "arrival": 600, "departure": 600},
+                ],
+            },
+            {
+                "trip_id": "T2",
+                "stops": [
+                    {"station": "P站", "arrival": 380, "departure": 380},
+                    {"station": "Z站", "arrival": 500, "departure": 500},
+                ],
+            },
+        ],
+    },
+    "new_timetable": {
+        "label": "调整后",
+        "trips": [
+            {
+                "trip_id": "T1",
+                "stops": [
+                    {"station": "X站", "arrival": 0, "departure": 0},
+                    {"station": "P站", "arrival": 300, "departure": 320},
+                    {"station": "Y站", "arrival": 600, "departure": 600},
+                ],
+            },
+            {
+                "trip_id": "T2",
+                "stops": [
+                    {"station": "P站", "arrival": 350, "departure": 350},
+                    {"station": "Z站", "arrival": 470, "departure": 470},
+                ],
+            },
+        ],
+    },
+    "minimum_transfer_seconds": {
+        "X站": 30,
+        "P站": 60,
+        "Y站": 30,
+        "Z站": 30,
+    },
+    "demands": [
+        {
+            "demand_id": "M1",
+            "origin": "X站",
+            "destination": "Z站",
+            "departure_time": 0,
+            "arrival_deadline": 500,
+        },
+        {
+            "demand_id": "M2",
+            "origin": "X站",
+            "destination": "Y站",
+            "departure_time": 0,
+            "arrival_deadline": 600,
+        },
+    ],
+}
+TRANSFER_EXAMPLE_EXPLANATION = (
+    "P 站最短换乘 60 秒。旧表 T1 于 300 秒到达 P 站，360 秒即可接续，"
+    "T2 在 380 秒发车（等号可接上），M1 经 1 次换乘于 500 秒按期到达 Z 站；"
+    "新表 T2 提前至 350 秒发车，360>350 赶不上，且无后续班次，M1 变为不可达。"
+    "M2 全程乘坐 T1，两表均 600 秒按期到达，不受影响。"
 )
 
 
-class SuppressionRequest(BaseModel):
-    """Input matrix with station labels and the small-flow threshold k."""
+# ---------------------------------------------------------------------------
+# 请求模型
+# ---------------------------------------------------------------------------
+class StopModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
-    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+    station: str = Field(..., min_length=1, description="站名")
+    arrival: int = Field(..., ge=0, description="到站秒（同一基准整数秒）")
+    departure: int = Field(..., ge=0, description="发车秒")
 
-    row_stations: List[str] = Field(
+
+class TripModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    trip_id: str = Field(..., min_length=1, description="车次编号，同一时刻表内不重复")
+    stops: List[StopModel] = Field(
         ...,
         min_length=2,
-        max_length=3,
-        validation_alias=AliasChoices(
-            "row_stations", "row_names", "rowLabels", "rows"
-        ),
-        description="Name of each row station / origin, 2..3 entries.",
-    )
-    column_stations: List[str] = Field(
-        ...,
-        min_length=2,
-        max_length=4,
-        validation_alias=AliasChoices(
-            "column_stations", "col_stations", "column_names", "cols"
-        ),
-        description="Name of each column station / destination, 2..4 entries.",
-    )
-    matrix: List[List[Annotated[int, Field(ge=0, le=10000)]]] = Field(
-        ...,
-        validation_alias=AliasChoices("matrix", "flow_matrix", "flows", "data"),
-        description="Passenger-flow matrix, 2..3 rows and 2..4 columns; each value 0..10000.",
-    )
-    k: Annotated[int, Field(ge=2, strict=True)] = Field(
-        ...,
-        validation_alias=AliasChoices("k", "threshold"),
-        description="Integer small-flow threshold, >= 2. Cells valued 1..k-1 are primary suppressed.",
+        max_length=MAX_STOPS,
+        description="停站记录 2..12 条，允许重复停站；停站序号从 1 开始",
     )
 
     @model_validator(mode="after")
-    def validate_shape_and_labels(self) -> "SuppressionRequest":
-        if len(self.matrix) != len(self.row_stations):
-            raise ValueError("matrix row count must equal the number of row stations")
-        if any(len(row) != len(self.column_stations) for row in self.matrix):
-            raise ValueError(
-                "each matrix row must have the same length as column_stations"
-            )
-        if any(not name.strip() for name in self.row_stations):
-            raise ValueError("row station names must not be empty")
-        if any(not name.strip() for name in self.column_stations):
-            raise ValueError("column station names must not be empty")
+    def validate_time_order(self) -> "TripModel":
+        for index, stop in enumerate(self.stops):
+            if stop.arrival > stop.departure:
+                raise ValueError(
+                    f"车次 {self.trip_id} 第 {index + 1} 站到站秒 {stop.arrival} "
+                    f"晚于发车秒 {stop.departure}"
+                )
+            if index > 0 and self.stops[index - 1].departure > stop.arrival:
+                raise ValueError(
+                    f"车次 {self.trip_id} 第 {index} 站发车秒 "
+                    f"{self.stops[index - 1].departure} 晚于第 {index + 1} 站到站秒 "
+                    f"{stop.arrival}"
+                )
         return self
 
 
-class CellRef(BaseModel):
-    row: int
-    column: int
-    row_station: str
-    column_station: str
+class TimetableModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: str = Field("时刻表", min_length=1, description="时刻表标签，便于区分新旧表")
+    trips: List[TripModel] = Field(
+        ..., min_length=1, max_length=MAX_TRIPS, description="车次 1..20 个"
+    )
+
+    @model_validator(mode="after")
+    def validate_trip_ids_unique(self) -> "TimetableModel":
+        ids = [trip.trip_id for trip in self.trips]
+        duplicates = sorted({trip_id for trip_id in ids if ids.count(trip_id) > 1})
+        if duplicates:
+            raise ValueError(f"{self.label}车次号重复：{', '.join(duplicates)}")
+        return self
 
 
-class SecondaryCell(CellRef):
-    suppression_type: Literal["secondary"] = "secondary"
+class DemandModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
+    demand_id: str = Field(..., min_length=1, description="需求编号，请求内不重复")
+    origin: str = Field(..., min_length=1, description="起点站")
+    destination: str = Field(..., min_length=1, description="终到站")
+    departure_time: int = Field(..., ge=0, description="出发秒")
+    arrival_deadline: int = Field(..., ge=0, description="到达期限秒")
 
-class PrimaryCell(CellRef):
-    suppression_type: Literal["primary"] = "primary"
-    min_feasible: int
-    max_feasible: int
-    feasible_value_count: int
-    protected: bool
-
-
-class SuppressionResponse(BaseModel):
-    status: Literal["ok"] = "ok"
-    message: str
-    k: int
-    row_stations: List[str]
-    column_stations: List[str]
-    published_matrix: List[List[Optional[int]]]
-    row_totals: List[int]
-    column_totals: List[int]
-    primary_suppressed_cells: List[PrimaryCell]
-    secondary_suppressed_cells: List[SecondaryCell]
-    primary_suppressed_count: int
-    secondary_suppressed_count: int
-    total_suppressed_count: int
-
-
-def _response(
-    request: SuppressionRequest, result: SolveResult
-) -> SuppressionResponse:
-    m = len(request.matrix)
-    n = len(request.matrix[0])
-    hidden = set(result.hidden_cells)
-    ranges = {(cell.row, cell.column): cell for cell in result.primary_ranges}
-
-    published_matrix: list[list[Optional[int]]] = []
-    for i in range(m):
-        row: list[Optional[int]] = []
-        for j in range(n):
-            row.append(None if (i, j) in hidden else request.matrix[i][j])
-        published_matrix.append(row)
-
-    primary_cells: list[PrimaryCell] = []
-    for i, j in result.primary_cells:
-        cell_range: CellRange = ranges[(i, j)]
-        primary_cells.append(
-            PrimaryCell(
-                row=i,
-                column=j,
-                row_station=request.row_stations[i],
-                column_station=request.column_stations[j],
-                min_feasible=cell_range.min_feasible,
-                max_feasible=cell_range.max_feasible,
-                feasible_value_count=cell_range.value_count,
-                protected=cell_range.protected,
+    @model_validator(mode="after")
+    def validate_deadline(self) -> "DemandModel":
+        if self.departure_time > self.arrival_deadline:
+            raise ValueError(
+                f"需求 {self.demand_id} 出发秒 {self.departure_time} "
+                f"晚于到达期限 {self.arrival_deadline}"
             )
-        )
+        return self
 
-    secondary_cells = [
-        SecondaryCell(
-            row=i,
-            column=j,
-            row_station=request.row_stations[i],
-            column_station=request.column_stations[j],
-        )
-        for i, j in result.secondary_cells
-    ]
 
-    if primary_cells:
-        message = (
-            f"已保留行列合计；先隐藏 {len(primary_cells)} 个小客流单元，"
-            f"并以最少 {len(secondary_cells)} 格补充隐藏。"
-        )
-    else:
-        message = "没有 1..k-1 人的小客流单元，矩阵无需隐藏，原样发布。"
+class ImpactRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
-    return SuppressionResponse(
-        message=message,
-        k=request.k,
-        row_stations=list(request.row_stations),
-        column_stations=list(request.column_stations),
-        published_matrix=published_matrix,
-        row_totals=list(result.row_totals),
-        column_totals=list(result.column_totals),
-        primary_suppressed_cells=primary_cells,
-        secondary_suppressed_cells=secondary_cells,
-        primary_suppressed_count=len(primary_cells),
-        secondary_suppressed_count=len(secondary_cells),
-        total_suppressed_count=len(hidden),
+    old_timetable: TimetableModel = Field(..., description="调整前时刻表")
+    new_timetable: TimetableModel = Field(..., description="调整后时刻表")
+    minimum_transfer_seconds: Dict[str, int] = Field(
+        ...,
+        min_length=1,
+        description="各站最短换乘秒数；时刻表中出现的每个车站都必须提供",
+    )
+    demands: List[DemandModel] = Field(
+        ..., min_length=1, max_length=MAX_DEMANDS, description="出行调查需求 1..30 条"
+    )
+
+    @model_validator(mode="after")
+    def validate_transfer_coverage_and_demand_stations(self) -> "ImpactRequest":
+        for key, value in self.minimum_transfer_seconds.items():
+            if not key.strip():
+                raise ValueError("minimum_transfer_seconds 的站名不能为空")
+            if value < 0:
+                raise ValueError(f"车站 {key} 的最短换乘秒数不能为负")
+        covered = set(self.minimum_transfer_seconds)
+        for timetable in (self.old_timetable, self.new_timetable):
+            stations = {
+                stop.station for trip in timetable.trips for stop in trip.stops
+            }
+            missing = sorted(stations - covered)
+            if missing:
+                raise ValueError(
+                    f"{timetable.label}中的车站 {', '.join(missing)} 缺少最短换乘秒数"
+                )
+        known_stations = (
+            {
+                stop.station
+                for trip in self.old_timetable.trips
+                for stop in trip.stops
+            }
+            | {
+                stop.station
+                for trip in self.new_timetable.trips
+                for stop in trip.stops
+            }
+        )
+        for demand in self.demands:
+            if demand.origin not in known_stations:
+                raise ValueError(f"需求 {demand.demand_id} 起点站 {demand.origin} 不在任何时刻表中")
+            if demand.destination not in known_stations:
+                raise ValueError(
+                    f"需求 {demand.demand_id} 终到站 {demand.destination} 不在任何时刻表中"
+                )
+        return self
+
+
+# ---------------------------------------------------------------------------
+# 响应模型
+# ---------------------------------------------------------------------------
+class LegOut(BaseModel):
+    trip_id: str
+    board_stop_index: int = Field(..., description="上车站在该车次停站记录中的 1-based 序号")
+    alight_stop_index: int = Field(..., description="下车站 1-based 序号")
+    board_station: str
+    alight_station: str
+    board_departure: int
+    alight_arrival: int
+    transfer_buffer_seconds: int = Field(
+        ..., description="上车前使用的换乘缓冲秒数；首次上车为 0"
     )
 
 
-def _example_response() -> dict:
-    request = SuppressionRequest.model_validate(EXAMPLE_REQUEST)
-    result = solve(request.matrix, request.k)
-    return _response(request, result).model_dump(mode="json")
+class JourneyOut(BaseModel):
+    legs: List[LegOut]
+    arrival_time: int
+    leg_count: int
+    transfer_count: int
 
 
-EXAMPLE_RESPONSE = _example_response()
+class ScenarioOut(BaseModel):
+    reachable: bool
+    earliest_arrival: Optional[int]
+    on_time: bool = Field(..., description="最早到达是否不晚于到达期限")
+    journey: Optional[JourneyOut]
 
-NO_SOLUTION_REQUEST = {
-    "row_stations": ["甲站", "乙站"],
-    "column_stations": ["丙站", "丁站"],
-    "matrix": [[3, 2], [0, 0]],
-    "k": 3,
-}
-NO_SOLUTION_EXAMPLE = {
-    "detail": {
-        "status": "no_solution",
-        "message": (
-            "无法保留这些行列合计发布：即使补充隐藏所有非初次隐藏单元，"
-            "仍有先隐藏单元只能取唯一值。"
+
+class DemandResultOut(BaseModel):
+    demand_id: str
+    origin: str
+    destination: str
+    departure_time: int
+    arrival_deadline: int
+    old: ScenarioOut
+    new: ScenarioOut
+    affected: bool = Field(
+        ..., description="是否受影响：旧表按期可达，而新表超期或不可达"
+    )
+    impact_type: Optional[Literal["late", "unreachable"]]
+
+
+class ImpactSummary(BaseModel):
+    total_demands: int
+    affected_count: int
+    affected_late_count: int
+    affected_unreachable_count: int
+    old_on_time_count: int
+    new_on_time_count: int
+    old_unreachable_count: int
+    new_unreachable_count: int
+
+
+class ImpactResponse(BaseModel):
+    status: Literal["ok"] = "ok"
+    message: str
+    summary: ImpactSummary
+    results: List[DemandResultOut]
+
+
+# ---------------------------------------------------------------------------
+# 数据转换
+# ---------------------------------------------------------------------------
+def _leg_out(leg: Leg) -> LegOut:
+    return LegOut(
+        trip_id=leg.trip_id,
+        board_stop_index=leg.board_stop_index,
+        alight_stop_index=leg.alight_stop_index,
+        board_station=leg.board_station,
+        alight_station=leg.alight_station,
+        board_departure=leg.board_departure,
+        alight_arrival=leg.alight_arrival,
+        transfer_buffer_seconds=leg.transfer_buffer_seconds,
+    )
+
+
+def _journey_out(journey: Optional[Journey]) -> Optional[JourneyOut]:
+    if journey is None:
+        return None
+    return JourneyOut(
+        legs=[_leg_out(leg) for leg in journey.legs],
+        arrival_time=journey.arrival_time,
+        leg_count=journey.leg_count,
+        transfer_count=journey.transfer_count,
+    )
+
+
+def _scenario_out(result: ScenarioResult) -> ScenarioOut:
+    return ScenarioOut(
+        reachable=result.reachable,
+        earliest_arrival=result.earliest_arrival,
+        on_time=result.on_time,
+        journey=_journey_out(result.journey),
+    )
+
+
+def _build_domain_objects(
+    payload: ImpactRequest,
+) -> tuple[Timetable, Timetable, dict[str, int], tuple[Demand, ...]]:
+    old_timetable = build_timetable(
+        [trip.model_dump(mode="json") for trip in payload.old_timetable.trips],
+        payload.old_timetable.label,
+    )
+    new_timetable = build_timetable(
+        [trip.model_dump(mode="json") for trip in payload.new_timetable.trips],
+        payload.new_timetable.label,
+    )
+    transfers = build_transfers(payload.minimum_transfer_seconds)
+    validate_transfer_coverage(old_timetable, new_timetable, transfers)
+    demands = build_demands(
+        [demand.model_dump(mode="json") for demand in payload.demands]
+    )
+    return old_timetable, new_timetable, transfers, demands
+
+
+def _response(payload: ImpactRequest, analyses: tuple[DemandAnalysis, ...]) -> ImpactResponse:
+    results: list[DemandResultOut] = []
+    for analysis in analyses:
+        results.append(
+            DemandResultOut(
+                demand_id=analysis.demand.demand_id,
+                origin=analysis.demand.origin,
+                destination=analysis.demand.destination,
+                departure_time=analysis.demand.departure_time,
+                arrival_deadline=analysis.demand.arrival_deadline,
+                old=_scenario_out(analysis.old),
+                new=_scenario_out(analysis.new),
+                affected=analysis.affected,
+                impact_type=analysis.impact_type,
+            )
+        )
+
+    summary = ImpactSummary(
+        total_demands=len(analyses),
+        affected_count=sum(item.affected for item in analyses),
+        affected_late_count=sum(item.impact_type == "late" for item in analyses),
+        affected_unreachable_count=sum(
+            item.impact_type == "unreachable" for item in analyses
         ),
-        "reason": "无法在保留公开行列合计的前提下保护所有小客流单元",
-        "unprotectable_cells": [
-            {
-                "row": 0,
-                "column": 1,
-                "row_station": "甲站",
-                "column_station": "丁站",
-            }
-        ],
-    }
-}
+        old_on_time_count=sum(item.old.on_time for item in analyses),
+        new_on_time_count=sum(item.new.on_time for item in analyses),
+        old_unreachable_count=sum(not item.old.reachable for item in analyses),
+        new_unreachable_count=sum(not item.new.reachable for item in analyses),
+    )
+    message = (
+        f"共分析 {summary.total_demands} 条出行需求：{summary.affected_count} 条受影响"
+        f"（超期 {summary.affected_late_count} 条、不可达 {summary.affected_unreachable_count} 条），"
+        "受影响定义为旧表按期可达而新表超期或不可达。"
+    )
+    return ImpactResponse(message=message, summary=summary, results=results)
+
+
+def _solve(payload: ImpactRequest) -> ImpactResponse:
+    old_timetable, new_timetable, transfers, demands = _build_domain_objects(payload)
+    analyses = analyze(old_timetable, new_timetable, transfers, demands)
+    return _response(payload, analyses)
+
+
+def _example_response(request_payload: dict) -> dict:
+    return _solve(ImpactRequest.model_validate(request_payload)).model_dump(mode="json")
+
+
+RING_EXAMPLE_RESPONSE = _example_response(RING_EXAMPLE_REQUEST)
+TRANSFER_EXAMPLE_RESPONSE = _example_response(TRANSFER_EXAMPLE_REQUEST)
 
 app = FastAPI(
-    title="公交站间客流补充隐藏 API",
-    summary="保留行列合计的小客流单元补充隐藏服务",
+    title="新增班次影响分析 API",
+    summary="时刻表调整前后最早到达与接驳影响分析服务",
     description=(
-        "接收带站名的 2～3 行、2～4 列客流矩阵和阈值 k。先隐藏值为 1～k−1 "
-        "的单元，再以最少格数补充隐藏其他单元，使每个先隐藏单元在所有符合"
-        "公开值和行列合计的非负整数矩阵中至少有两个可行值。发布矩阵以 null "
-        "表示隐藏格；返回结果同时列出每个先隐藏单元的最小/最大可行值，供内部核对。\n\n"
-        "**示例说明：** " + EXAMPLE_EXPLANATION
+        "接收调整前、调整后两份时刻表（各至多 20 个车次、每车次 2..12 条停站）、"
+        "各站最短换乘秒数及至多 30 条出行调查需求。对每条需求分别在两份时刻表上"
+        "求最早到达时间及乘车方案（列明车次与上、下车停站序号），并标出旧表按期"
+        "而新表超期或不可达的需求。\n\n"
+        "乘车规则：可等待、同车跨站乘坐、最多换车 2 次；首次上车无需缓冲，"
+        "换车须满足接续车次发车不早于到达时刻加本站最短换乘秒数，等号可接上。\n\n"
+        "**环线示例：** " + RING_EXAMPLE_EXPLANATION + "\n\n"
+        "**换乘临界示例：** " + TRANSFER_EXAMPLE_EXPLANATION
     ),
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_url="/openapi.json",
     openapi_tags=[
-        {"name": "suppression", "description": "补充隐藏求解"},
-        {"name": "examples", "description": "可调用示例"},
+        {"name": "impact", "description": "新增班次影响分析"},
+        {"name": "examples", "description": "可调用示例（环线、换乘临界）"},
         {"name": "system", "description": "服务状态"},
     ],
 )
@@ -253,120 +520,92 @@ def health() -> dict:
 @app.get(
     "/example",
     tags=["examples"],
-    summary="获取可反推小客流示例请求",
-    description="该示例在只做初次隐藏时可通过行列合计反推出小客流，因此需要补充隐藏。",
+    summary="获取环线与换乘临界两个示例的请求、预期响应和 curl",
 )
 def example() -> dict:
     return {
-        "description": EXAMPLE_EXPLANATION,
-        "request": EXAMPLE_REQUEST,
-        "expected_response": EXAMPLE_RESPONSE,
-        "curl": (
-            "curl -s -X POST http://localhost:8000/suppress "
-            "-H 'Content-Type: application/json' "
-            f"-d '{json.dumps(EXAMPLE_REQUEST, ensure_ascii=False)}'"
-        ),
+        "ring_line_example": {
+            "description": RING_EXAMPLE_EXPLANATION,
+            "request": RING_EXAMPLE_REQUEST,
+            "expected_response": RING_EXAMPLE_RESPONSE,
+            "curl": (
+                "curl -s -X POST http://localhost:8000/impact "
+                "-H 'Content-Type: application/json' "
+                f"-d '{json.dumps(RING_EXAMPLE_REQUEST, ensure_ascii=False)}'"
+            ),
+        },
+        "transfer_critical_example": {
+            "description": TRANSFER_EXAMPLE_EXPLANATION,
+            "request": TRANSFER_EXAMPLE_REQUEST,
+            "expected_response": TRANSFER_EXAMPLE_RESPONSE,
+            "curl": (
+                "curl -s -X POST http://localhost:8000/impact "
+                "-H 'Content-Type: application/json' "
+                f"-d '{json.dumps(TRANSFER_EXAMPLE_REQUEST, ensure_ascii=False)}'"
+            ),
+        },
     }
 
 
 @app.post(
-    "/suppress",
-    tags=["suppression"],
-    response_model=SuppressionResponse,
-    summary="计算最小补充隐藏并发布矩阵",
+    "/impact",
+    tags=["impact"],
+    response_model=ImpactResponse,
+    summary="分析时刻表调整对每条出行需求的影响",
     description=(
-        "输入 row_stations、column_stations、matrix、k。输出用 null 表示隐藏格的"
-        "发布矩阵、原始行列合计、补充隐藏单元，以及每个先隐藏单元的最小/最大可行值。"
+        "分别在旧表、新表上求每条需求的最早到达时间与乘车方案；不可达单列，"
+        "并标记旧表按期而新表超期（late）或不可达（unreachable）的需求。"
     ),
     responses={
         200: {
-            "description": "成功；若 k 范围内没有小客流单元，矩阵原样发布。",
-            "content": {"application/json": {"example": EXAMPLE_RESPONSE}},
-        },
-        422: {
-            "description": "输入校验失败，或无法在保留这些行列合计的前提下保护所有小客流单元。",
+            "description": "成功；results 按需求顺序给出新旧两表的最早到达与方案。",
             "content": {
                 "application/json": {
                     "examples": {
-                        "no_solution": {
-                            "summary": "无解：小客流被合计结构性固定",
-                            "value": NO_SOLUTION_EXAMPLE,
-                        }
+                        "ring_line": {
+                            "summary": "环线重复停站：两条需求超期",
+                            "value": RING_EXAMPLE_RESPONSE,
+                        },
+                        "transfer_critical": {
+                            "summary": "换乘临界：一条需求变为不可达",
+                            "value": TRANSFER_EXAMPLE_RESPONSE,
+                        },
                     }
                 }
             },
         },
+        422: {"description": "输入校验失败（结构、时刻顺序、换乘秒数覆盖等）。"},
     },
 )
-def suppress(
-    payload: SuppressionRequest = Body(
+def impact(
+    payload: ImpactRequest = Body(
         ...,
         openapi_examples={
-            "reverse_inferable_small_flow": {
-                "summary": "可反推的 1 人客流（2×3）",
-                "description": EXAMPLE_EXPLANATION,
-                "value": EXAMPLE_REQUEST,
+            "ring_line": {
+                "summary": "环线示例（重复停站、整体延后）",
+                "description": RING_EXAMPLE_EXPLANATION,
+                "value": RING_EXAMPLE_REQUEST,
             },
-            "no_solution": {
-                "summary": "无法保留合计发布的无解输入",
-                "description": (
-                    "乙站整行客流为 0，丁站列合计只能由 (0,1)=2 提供，"
-                    "补充隐藏任何其他格都无法让小客流有两个可行值。"
-                ),
-                "value": NO_SOLUTION_REQUEST,
+            "transfer_critical": {
+                "summary": "换乘临界示例（缓冲等号、接续失败）",
+                "description": TRANSFER_EXAMPLE_EXPLANATION,
+                "value": TRANSFER_EXAMPLE_REQUEST,
             },
         },
     ),
-) -> SuppressionResponse:
+) -> ImpactResponse:
     try:
-        result = solve(payload.matrix, payload.k)
-    except NoSolutionError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "status": "no_solution",
-                "message": (
-                    "无法保留这些行列合计发布：即使补充隐藏所有非初次隐藏单元，"
-                    "仍有先隐藏单元只能取唯一值。"
-                ),
-                "reason": exc.message,
-                "unprotectable_cells": [
-                    {
-                        "row": i,
-                        "column": j,
-                        "row_station": payload.row_stations[i],
-                        "column_station": payload.column_stations[j],
-                    }
-                    for i, j in exc.unprotectable_cells
-                ],
-            },
-        )
+        return _solve(payload)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
-    return _response(payload, result)
+
+# 便于对接的别名，不纳入 /docs，避免与主入口混淆。
+@app.post("/analyze", include_in_schema=False, response_model=ImpactResponse)
+def analyze_alias(payload: ImpactRequest) -> ImpactResponse:
+    return impact(payload)
 
 
-# Friendly aliases.  They are omitted from /docs to keep the canonical
-# operation and its examples unambiguous, but remain directly callable.
-@app.post("/protect", include_in_schema=False, response_model=SuppressionResponse)
-def protect_alias(payload: SuppressionRequest) -> SuppressionResponse:
-    return suppress(payload)
-
-
-@app.post(
-    "/api/v1/suppress",
-    include_in_schema=False,
-    response_model=SuppressionResponse,
-)
-def suppress_v1_alias(payload: SuppressionRequest) -> SuppressionResponse:
-    return suppress(payload)
-
-
-@app.post(
-    "/api/suppress",
-    include_in_schema=False,
-    response_model=SuppressionResponse,
-)
-def suppress_api_alias(payload: SuppressionRequest) -> SuppressionResponse:
-    return suppress(payload)
+@app.post("/api/v1/impact", include_in_schema=False, response_model=ImpactResponse)
+def impact_v1_alias(payload: ImpactRequest) -> ImpactResponse:
+    return impact(payload)
